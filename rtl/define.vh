@@ -6,7 +6,7 @@
 `endif
 
 `ifndef SOFTMAX_BLOCK_SIZE
-`define SOFTMAX_BLOCK_SIZE 8
+`define SOFTMAX_BLOCK_SIZE 4
 `endif
 
 `ifndef SOFTMAX_USE_TSMC90_SLOT_SRAM

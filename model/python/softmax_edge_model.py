@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""边缘设备 Softmax 硬件加速器的 Python 参考模型。
-
-这个文件不是训练或部署框架里的通用神经网络“模型”，而是
-``softmax硬件加速设计.md`` 对应的功能/数值参考实现。它的主要用途是：
-
-1. 用 Python 模拟文档中冻结下来的 7 模块数据通路；
-2. 把定点位宽、剪枝阈值、PWL 系数等设计选择暴露成可调参数；
-3. 在 RTL 编写和验证之前，先提供一个可执行的软件基线；
-4. 将硬件风格的近似 Softmax 输出与精确浮点 Softmax 做误差对比。
-
-当前保留 ``doc_adaptive_desc8_q6_special4`` 这一套与 ``rtl/softmax_top.v``
-对齐的位级语义配置，并额外提供 ``doc_adaptive_desc9_q7_special4`` 作为
-同语义升一位小数精度的 Python 精度探索配置，以及
-``doc_adaptive_desc9_q7_special4_block4`` 作为 block size = 4 的 RTL 对齐配置。
-
-本文件当前对齐的冻结架构为：
-1. FP16/BF16 -> base-2 Q6.10
-2. block 内局部 max 搜索，得到 ``M_i = ceil(block_max)``
-3. block 剪枝、整数差分元素剪枝、``z = y - M_i``、描述符生成
-4. ``exp_2`` 近似与 block 局部分母和 ``block_sum``
-5. block 级 ``(M_i, block_sum)`` 做 row-level online merge，写出最小 ``row_ctx``
-6. ``M6`` 进入该行后先做一次分母规格化，再基于紧凑描述符和 ``block_delta`` 恢复最终输出
-"""
 
 from __future__ import annotations
 
@@ -59,19 +36,6 @@ def special_descriptor_frac_width(descriptor_mode: str) -> int | None:
 
 @dataclass(frozen=True)
 class FixedFormat:
-    """有符号/无符号定点格式辅助类。
-
-    例如：
-    - Q6.10 表示 6 位整数 + 10 位小数；
-    - 内部实际以整数 `raw` 形式存储；
-    - 实际值 = raw / 2^frac_width。
-
-    在设计文档中，几乎所有内部数据通路都采用某种 Qm.n 定点格式。
-    这个辅助类统一封装三类基础行为，保证各模块采用相同的数值约定：
-    - 计算可表示范围；
-    - 执行带饱和的量化；
-    - 在原始整数表示和实数表示之间转换。
-    """
 
     int_width: int
     frac_width: int
@@ -98,8 +62,6 @@ class FixedFormat:
         return (1 << (self.total_width - 1)) - 1
 
     def quantize(self, value: float) -> int:
-        # 硬件通常会把数值钳制到可表示范围内，而不是无限传播异常大值。
-        # 这里模拟的就是浮点输入进入定点存储时的饱和量化行为。
         if math.isnan(value):
             value = 0.0
         if math.isinf(value):
@@ -108,17 +70,11 @@ class FixedFormat:
         return max(self.min_raw, min(self.max_raw, raw))
 
     def to_float(self, raw: int) -> float:
-        # 把硬件风格的整数存储值还原成便于阅读的实数值。
         return raw / self.scale
 
 
 @dataclass(frozen=True)
 class DescriptorConfig:
-    """模块3与模块4共享的紧凑 Y 描述符格式。
-
-    设计文档明确要求中间缓存不要直接保存完整的 ``y`` 或完整的 ``exp(y)``。
-    模块3只保存紧凑描述符，模块4再依据描述符恢复分子。
-    """
 
     shift_width: int
     frac_width: int
@@ -126,17 +82,6 @@ class DescriptorConfig:
 
 @dataclass(frozen=True)
 class SoftmaxModelConfig:
-    """顶层硬件风格参数集合。
-
-    每个字段都直接对应设计文档中的一个架构选择，例如：
-    - 外部总线宽度与内部 lane 并行度；
-    - 内部定点位宽；
-    - 描述符缓存位宽；
-    - 剪枝阈值；
-    - exp 近似与 M6 分母补偿路径。
-
-    这样 Python 模型就可以在 RTL 定稿之前承担扫参和误差评估工作。
-    """
 
     input_format: str = "fp16"
     bus_width: int | None = None
@@ -180,7 +125,6 @@ class SoftmaxModelConfig:
 
     @property
     def lane_num(self) -> int:
-        # 为兼容旧版输出保留 ``lane_num`` 别名；当前文档口径以 ``lane_count`` 为准。
         return self.lane_count_effective
 
     @property
@@ -225,8 +169,6 @@ class SoftmaxModelConfig:
 
     @property
     def out_fmt(self) -> FixedFormat:
-        # 最终对外输出概率范围固定在 [0, 1]。
-        # 当前 RTL 对齐配置使用 UQ1.15；这里仍保留小数位宽可调，整数位固定为 1。
         return FixedFormat(1, self.out_frac_width, signed=False)
 
     @property
@@ -269,23 +211,6 @@ class SoftmaxModelConfig:
 
 @dataclass
 class SoftmaxDescriptor:
-    """Compact y descriptor stored in the Y Descriptor Buffer.
-
-    不直接保存完整 y，而是保存：
-    - y_shift: 由 floor(y) 推导出的移位量
-    - y_frac_raw: [0, 1) 范围内的小数部分
-    - y_prune: 该项是否被提前剪枝
-
-    按文档记号可写为：
-    - y = u + v
-    - u = floor(y) <= 0
-    - v in [0, 1)
-    - y_shift = -u
-    - y_frac_raw 是 v 的量化值
-
-    模块4据此可以恢复：
-    2^y = 2^(-y_shift) * 2^(y_frac)
-    """
 
     y_shift: int
     y_frac_raw: int
@@ -294,7 +219,6 @@ class SoftmaxDescriptor:
 
 @dataclass
 class BlockMeta:
-    """Block 元数据，模拟文档中的 meta RAM 记录。"""
 
     row_id: int
     block_index: int
@@ -312,7 +236,6 @@ class BlockMeta:
 
 @dataclass
 class RowFinalStateToken:
-    """模块5输出并写入 ``row_ctx`` 的最小行级上下文。"""
 
     row_id: int
     row_bank: int
@@ -323,7 +246,6 @@ class RowFinalStateToken:
 
 @dataclass
 class RowNormalizationToken:
-    """模块6读取 ``row_ctx`` 后生成的本地分母状态。"""
 
     row_id: int
     row_bank: int
@@ -338,11 +260,6 @@ class RowNormalizationToken:
 
 @dataclass
 class SoftmaxRowResult:
-    """一整行仿真结果的追踪容器。
-
-    这里故意保留了大量中间值，目的是让这个模型不仅能给最终输出，
-    还可以作为调试工具、教学材料，以及和 RTL 波形做逐阶段对照的参考。
-    """
 
     input_row: List[float]
     fp_quantized_row: List[float]
@@ -390,13 +307,6 @@ class SoftmaxRowResult:
 
 @dataclass
 class SoftmaxBatchEvalSummary:
-    """批量评估摘要。
-
-    由于 softmax 输出是连续概率分布，单独说“准确率”容易有歧义。
-    这里同时保留两类指标：
-    - top1_match_rate：近似输出的最大概率位置是否与精确 softmax 一致；
-    - 误差类指标：衡量整个概率分布与参考值之间偏差有多大。
-    """
 
     profile: str
     num_rows: int
@@ -427,14 +337,6 @@ class SoftmaxBatchEvalSummary:
 
 @dataclass(frozen=True)
 class WorkloadSpec:
-    """描述一类 softmax 输入工作负载。
-
-    这里的 ``bert-base`` / ``mobilevit`` 预设不是从真实模型运行时直接抓取
-    的精确统计分布，而是基于这些模型常见 softmax 场景给出的近似 workload：
-    - ``bert-base`` 更接近 attention score 的 softmax，行长度更大，logits 更集中；
-    - ``mobilevit`` 更接近边缘视觉模型里的分类/轻量注意力 softmax，行长度更小，
-      logits 离散程度略大。
-    """
 
     name: str
     default_row_depth: int
@@ -446,10 +348,6 @@ class WorkloadSpec:
 
 
 def quantize_fp16(value: float) -> float:
-    """把 Python 浮点数按 IEEE FP16 量化后再转回 Python float。
-
-    这样做是为了让后级模块先看到和真实 FP16 输入硬件一致的精度损失。
-    """
     try:
         return struct.unpack(">e", struct.pack(">e", float(value)))[0]
     except OverflowError:
@@ -477,7 +375,6 @@ def quantize_bf16(value: float) -> float:
 
 
 def quantize_input_format(value: float, input_format: str) -> float:
-    """执行文档规定的输入格式量化。"""
     if input_format == "fp16":
         return quantize_fp16(value)
     if input_format == "bf16":
@@ -486,11 +383,6 @@ def quantize_input_format(value: float, input_format: str) -> float:
 
 
 def split_blocks(values: Sequence[int], block_size: int) -> List[List[int]]:
-    """把一整行切分成硬件语义下的多个 block。
-
-    在设计文档里，一个 block 表示一次总线拍内并行处理的一组元素。
-    block 内先做局部最大值和局部分母和，再在行级做合并。
-    """
     return [list(values[idx : idx + block_size]) for idx in range(0, len(values), block_size)]
 
 
@@ -516,20 +408,16 @@ def topk_indices(values: Sequence[float], k: int) -> Tuple[int, ...]:
 
 
 def fixed_floor_int(raw_value: int, frac_width: int) -> int:
-    # 对有符号补码定点数来说，算术右移等价于文档里的 ``floor(x_fx)``
-    # 整数部分提取方式。
     return raw_value >> frac_width
 
 
 def fixed_trunc_int(raw_value: int, frac_width: int) -> int:
-    # 当前优化版若采用“直接截取整数部分”，其语义是朝 0 截断，而不是 floor。
     if raw_value >= 0:
         return raw_value >> frac_width
     return -((-raw_value) >> frac_width)
 
 
 def fixed_ceil_int(raw_value: int, frac_width: int) -> int:
-    """把有符号补码定点数按 ``ceil`` 压成整数锚点。"""
     floor_int = fixed_floor_int(raw_value, frac_width)
     frac_mask = (1 << frac_width) - 1
     if raw_value & frac_mask:
@@ -547,10 +435,6 @@ def rescale_signed_raw(raw_value: int, src_frac_width: int, dst_frac_width: int)
 
 
 def rescale_frac_raw(raw_value: int, src_frac_width: int, dst_frac_width: int) -> int:
-    """在尽量保持数值不变的前提下调整小数位宽。
-
-    这个函数主要用于模块3把完整小数部分缩放后写入 Y Descriptor Buffer。
-    """
     if dst_frac_width == src_frac_width:
         return raw_value
     if dst_frac_width > src_frac_width:
@@ -560,7 +444,6 @@ def rescale_frac_raw(raw_value: int, src_frac_width: int, dst_frac_width: int) -
 
 
 def clamp_raw(raw_value: int, fmt: FixedFormat) -> int:
-    """把原始定点值钳制到目标格式范围内。"""
     return max(fmt.min_raw, min(fmt.max_raw, raw_value))
 
 
@@ -593,14 +476,6 @@ def rtl_m1_fp16_to_base2_q6_10(fp16_bits: int) -> int:
 
 
 def shift_add_multiply(raw_value: int, shift_terms: Iterable[Tuple[int, int]]) -> int:
-    """只用移位和加减法近似乘法。
-
-    例如：
-    +0,+2,+3 表示 raw * (1 + 1/4 + 1/8)
-
-    这对应文档中对 ``log2(e)`` 的实现要求：不用通用乘法器，而采用
-    若干移位项的加减近似。
-    """
     result = 0
     for sign, shift in shift_terms:
         term = raw_value if shift == 0 else (raw_value >> shift)
@@ -609,11 +484,6 @@ def shift_add_multiply(raw_value: int, shift_terms: Iterable[Tuple[int, int]]) -
 
 
 def approx_exp2_frac(frac_value: float, mode: str) -> float:
-    """对区间 [0, 1) 内的 2^v 做近似。
-
-    当前仅保留优化版文档冻结方案：
-    - mode DOC：整段割线 + 3/16 三角补偿
-    """
     if not 0.0 <= frac_value < 1.0:
         frac_value = min(max(frac_value, 0.0), math.nextafter(1.0, 0.0))
     if mode == "DOC":
@@ -623,10 +493,6 @@ def approx_exp2_frac(frac_value: float, mode: str) -> float:
 
 
 def approx_exp2_frac_raw(frac_raw: int, frac_width: int, mode: str) -> int:
-    """在 Q0.frac_width 域对 2^v 的 mantissa 做定点近似。
-
-    返回值格式为 Q1.frac_width。
-    """
     unit_raw = 1 << frac_width
     frac_raw = max(0, min(unit_raw - 1, frac_raw))
     if mode == "DOC":
@@ -637,7 +503,6 @@ def approx_exp2_frac_raw(frac_raw: int, frac_width: int, mode: str) -> int:
 
 
 def approx_delta_triangle(k_value: float) -> float:
-    """对 ``Delta(k)`` 做文档中的三角波/波谷补偿近似。"""
     if not 0.0 <= k_value < 1.0:
         k_value = min(max(k_value, 0.0), math.nextafter(1.0, 0.0))
     folded = k_value if k_value < 0.5 else (1.0 - k_value)
@@ -645,7 +510,6 @@ def approx_delta_triangle(k_value: float) -> float:
 
 
 def approx_delta_triangle_raw(k_raw: int, frac_width: int) -> int:
-    """在 ``Q0.frac_width`` 域里计算 ``Delta(k)`` 的量化值。"""
     unit_raw = 1 << frac_width
     k_raw = max(0, min(unit_raw - 1, k_raw))
     folded_raw = k_raw if k_raw < (unit_raw >> 1) else (unit_raw - k_raw)
@@ -653,14 +517,6 @@ def approx_delta_triangle_raw(k_raw: int, frac_width: int) -> int:
 
 
 def normalize_sum(sum_raw: int, frac_width: int) -> Tuple[int, int]:
-    """把正定点数分母规格化为 M * 2^E 形式。
-
-    规格化后：
-    - M 落在 [1, 2)
-    - E 是 2 的幂指数
-
-    这就是模块6在做 ``k / Delta(k)`` 分母补偿前必须执行的规格化步骤。
-    """
     if sum_raw <= 0:
         return 0, 0
     highest_bit = sum_raw.bit_length() - 1
@@ -673,13 +529,6 @@ def normalize_sum(sum_raw: int, frac_width: int) -> Tuple[int, int]:
 
 
 def quantize_output_probability(prob_value: float, frac_width: int) -> int:
-    """按文档最终版规则量化输出概率。
-
-    规则：
-    - 输出格式：unsigned Q1.frac_width
-    - 数值范围：饱和到 [0, 1.0]
-    - 量化方式：round-half-up
-    """
     scale = 1 << frac_width
     if prob_value <= 0.0:
         return 0
@@ -689,7 +538,6 @@ def quantize_output_probability(prob_value: float, frac_width: int) -> int:
 
 
 def exact_softmax(row: Sequence[float]) -> List[float]:
-    """精确浮点 Softmax 参考实现，用作误差基线。"""
     if not row:
         return []
     max_value = max(row)
@@ -701,23 +549,14 @@ def exact_softmax(row: Sequence[float]) -> List[float]:
 
 
 def calculate_kl_divergence(p: Sequence[float], q: Sequence[float], eps: float = 1e-10) -> float:
-    """计算 KL 散度 D_KL(P || Q)。
-
-    P 是参考真值分布，Q 是近似分布。
-    为了避免 log(0)，对 Q 进行了微小的偏移处理。
-    """
     kl = 0.0
     for p_val, q_val in zip(p, q):
         if p_val > 0:
-            # P 为真值，Q 为硬件近似。如果 Q 为 0（被剪枝），KL 会无穷大。
-            # 硬件设计中，通常认为只要 P 也很小，这种误差是可以接受的。
-            # 这里加个 eps 保证数值稳定。
             kl += p_val * math.log((p_val + eps) / (q_val + eps))
     return max(0.0, kl)
 
 
 class SoftmaxEdgeModel:
-    """六模块边缘 Softmax 加速器的可执行参考模型。"""
 
     def __init__(self, cfg: SoftmaxModelConfig):
         self.cfg = cfg
@@ -919,7 +758,6 @@ class SoftmaxEdgeModel:
         return tau_elem, tau_elem_int, tau_blk, c2_count
 
     def module1_fp_to_fx(self, row: Sequence[float]) -> Tuple[List[float], List[int], List[float]]:
-        """模块1：输入量化并转换到 base-2 域 Qm.n。"""
         if self.rtl_exact_enabled() and self.cfg.input_format == "fp16" and np is not None:
             row_np = np.asarray(row, dtype=np.float32)
             with np.errstate(over="ignore"):
@@ -955,7 +793,6 @@ class SoftmaxEdgeModel:
         return fp_quantized, fx_raw, fx_values
 
     def module2_block_load_max(self, fx_raw_row: Sequence[int]) -> Tuple[List[int], List[int]]:
-        """模块2：按 block 搜索局部最大值并形成整数锚点 ``M_i = ceil(max)``。"""
         block_max_integer_parts: List[int] = []
         block_max_values: List[int] = []
         for block in split_blocks(fx_raw_row, self.cfg.block_size_effective):
@@ -967,7 +804,6 @@ class SoftmaxEdgeModel:
     def module3_block_prune_y_generate(
         self, fx_raw_row: Sequence[int], block_max_values: Sequence[int]
     ) -> Tuple[List[BlockMeta], List[SoftmaxDescriptor], List[int], List[float], List[bool], List[bool], List[float]]:
-        """模块3：block 剪枝、y 生成、descriptor 与 meta partial 写回。"""
         y_raw_row: List[int] = []
         y_row: List[float] = []
         descriptors: List[SoftmaxDescriptor] = []
@@ -1013,7 +849,6 @@ class SoftmaxEdgeModel:
                 if prune_compare_mode == "full_y":
                     element_pruned = y_raw < prune_raw
                 else:
-                    # 数学等价口径：比较整数部分与门限 M_i + tau_elem。
                     element_pruned = self.element_prune_integer_extract(fx_raw, prune_compare_mode) < element_threshold_int
                 element_prune_flags.append(element_pruned)
                 final_pruned = block_pruned or element_pruned
@@ -1051,7 +886,6 @@ class SoftmaxEdgeModel:
         metas: Sequence[BlockMeta],
         y_raw_row: Sequence[int],
     ) -> Tuple[List[BlockMeta], List[int]]:
-        """模块4：消费描述符流，完成 exp 与 block 局部分母和。"""
         completed_metas: List[BlockMeta] = []
         block_sum_raw_values: List[int] = []
         for meta in metas:
@@ -1100,7 +934,6 @@ class SoftmaxEdgeModel:
         return completed_metas, block_sum_raw_values
 
     def module5_row_online_merge(self, metas: Sequence[BlockMeta]) -> RowFinalStateToken:
-        """模块5：block 元数据在线合并成整行最终状态。"""
         if not metas:
             return RowFinalStateToken(row_id=0, row_bank=0, row_max_value_final=0, row_sum_final_raw=0, block_count=0)
         max_accumulator = metas[0].block_max_value
@@ -1124,7 +957,6 @@ class SoftmaxEdgeModel:
     def module6_row_denom_prep(
         self, row_final_state_token: RowFinalStateToken
     ) -> Tuple[int, float, int, int, float, int, float, RowNormalizationToken]:
-        """模块6：读取最小 ``row_ctx`` 后，先做一次整行分母规格化。"""
         if row_final_state_token.row_sum_final_raw <= 0:
             zero_token = RowNormalizationToken(
                 row_id=row_final_state_token.row_id,
@@ -1184,7 +1016,6 @@ class SoftmaxEdgeModel:
         metas: Sequence[BlockMeta],
         row_normalization_token: RowNormalizationToken,
     ) -> Tuple[List[float], List[int]]:
-        """模块6：按 block 边界复用 block_delta，回放并恢复最终输出。"""
         approx_probs: List[float] = []
         approx_probs_raw: List[int] = []
         out_scale = 1 << self.cfg.out_frac_width
@@ -1239,7 +1070,6 @@ class SoftmaxEdgeModel:
         return approx_probs, approx_probs_raw
 
     def simulate_row(self, row: Sequence[float]) -> SoftmaxRowResult:
-        """让一整行数据完整流过 7 模块参考模型。"""
         fp_quantized_row, fx_raw_row, fx_row = self.module1_fp_to_fx(row)
         block_max_integer_parts, block_max_values = self.module2_block_load_max(fx_raw_row)
         (
@@ -1662,12 +1492,6 @@ class SoftmaxEdgeModel:
             return approx_probs, prune_stats
 
     def simulate_rows_fast(self, rows: Sequence[Sequence[float]] | "np.ndarray") -> Tuple["np.ndarray", Dict[str, int]]:
-        """批量任务级推理快路径。
-
-        优先为 BERT attention 这种“同一拍里很多 row、同一 row_depth”场景服务。
-        当前仅对 `rtl_exact + fp16 + row_depth % BLOCK_SIZE == 0` 启用向量化；
-        其余情况自动回退到逐 row 快路径，保证功能不变。
-        """
         if torch is not None and isinstance(rows, torch.Tensor):
             if rows.device.type == "cpu":
                 return self.simulate_rows_fast(rows.detach().to(dtype=torch.float32).numpy())  # type: ignore[return-value]
@@ -1829,11 +1653,6 @@ class SoftmaxEdgeModel:
         return approx_probs, prune_stats
 
     def simulate_row_fast(self, row: Sequence[float]) -> Tuple[List[float], List[float], Dict[str, int]]:
-        """任务级推理快路径。
-
-        只返回量化后的输入和最终近似 softmax，不构造整套调试结果。
-        这样可显著降低在 BERT 任务级评测里替换 softmax 时的 Python 开销。
-        """
         fp_quantized_row, fx_raw_row, _ = self.module1_fp_to_fx(row)
         _, block_max_values = self.module2_block_load_max(fx_raw_row)
         partial_metas, descriptors, y_raw_row, _, element_prune_flags, prune_flags, _ = self.module3_block_prune_y_generate(
@@ -1888,20 +1707,11 @@ def generate_random_row(row_depth: int, seed: int) -> List[float]:
 def generate_random_dataset(
     num_rows: int, row_depth: int, seed: int, value_min: float, value_max: float
 ) -> List[List[float]]:
-    """生成一批随机输入行，用于批量评估。"""
     rng = random.Random(seed)
     return [[rng.uniform(value_min, value_max) for _ in range(row_depth)] for _ in range(num_rows)]
 
 
 def get_workload_spec(workload: str) -> WorkloadSpec:
-    """返回预置 workload 规格。
-
-    注意：
-    这些 workload 是“参考某类模型 softmax 形态”的近似分布，不是从真实
-    MobileViT / BERT-base 某一层直接导出的 ground-truth logits。
-    如果你要最严格的对比，应当把真实模型导出的 logits 存成文件后再喂给
-    本脚本。
-    """
     specs = {
         "uniform": WorkloadSpec(
             name="uniform",
@@ -1944,7 +1754,6 @@ def generate_workload_dataset(
     value_min: float,
     value_max: float,
 ) -> List[List[float]]:
-    """根据 workload 预设生成一批输入行。"""
     spec = get_workload_spec(workload)
     rng = random.Random(seed)
     if workload == "uniform":
@@ -1961,12 +1770,6 @@ def generate_workload_dataset(
 
 
 def load_rows_from_file(file_path: str) -> List[List[float]]:
-    """从文本文件读取 logits。
-
-    支持两种简单格式：
-    - 每行逗号分隔：``1.0,2.0,3.0``
-    - 每行 JSON 数组：``[1.0, 2.0, 3.0]``
-    """
     rows: List[List[float]] = []
     with open(file_path, "r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
@@ -2015,7 +1818,6 @@ def parse_shift_terms(terms_text: str) -> Tuple[Tuple[int, int], ...]:
 
 
 def result_to_dict(result: SoftmaxRowResult) -> dict:
-    """把嵌套 dataclass 展开成适合 JSON 输出的普通字典。"""
     data = asdict(result)
     data["descriptors"] = [asdict(desc) for desc in result.descriptors]
     data["row_ctx"] = dict(data["row_final_state_token"])
@@ -2024,7 +1826,6 @@ def result_to_dict(result: SoftmaxRowResult) -> dict:
 
 
 def config_to_dict(cfg: SoftmaxModelConfig) -> dict:
-    """把配置对象展开成可序列化字典。"""
     data = asdict(cfg)
     data["row_len"] = cfg.row_len
     data["lane_count_effective"] = cfg.lane_count_effective
@@ -2043,12 +1844,10 @@ def config_to_dict(cfg: SoftmaxModelConfig) -> dict:
 
 
 def batch_summary_to_dict(summary: SoftmaxBatchEvalSummary) -> dict:
-    """把批量评估摘要展开成字典。"""
     return asdict(summary)
 
 
 def describe_block_prune_threshold(cfg: SoftmaxModelConfig) -> str:
-    """返回 block 门限的用户可读描述。"""
     if cfg.block_prune_threshold is None:
         return (
             f"auto(sum_frac={cfg.sum_frac_width},"
@@ -2069,19 +1868,6 @@ def describe_elem_prune_policy(cfg: SoftmaxModelConfig) -> str:
 
 
 def get_precision_profile_overrides(profile: str) -> Dict[str, object]:
-    """返回不同精度档位的参数覆盖表。
-
-    设计原则：
-    - ``doc_adaptive_desc8_q6_special4``：当前 RTL 对齐的 2+6 描述符预设；
-    - ``doc_adaptive_desc9_q7_special4``：同语义的 2+7 描述符精度探索预设；
-    - ``doc_adaptive_desc9_q7_special4_block4``：block size = 4 的 2+7 RTL 对齐预设；
-    - ``custom``：完全使用命令行显式给定的参数，不做额外覆盖。
-
-    说明：
-    ``exp_frac_width`` 与 ``sum_frac_width`` 在这个模型里最好保持一致，
-    因为模块4产生的 ``exp_raw`` 会直接送入分母累加路径。两者若失配，
-    会把分母的尺度关系拉坏，导致比较结果失真。
-    """
     if profile == "custom":
         return {}
     if profile == "doc_adaptive_desc8_q6_special4":
@@ -2169,7 +1955,6 @@ def get_precision_profile_overrides(profile: str) -> Dict[str, object]:
 
 
 def build_config_from_args(args: argparse.Namespace, profile: str) -> SoftmaxModelConfig:
-    """根据命令行参数和精度档位构造配置。"""
     cfg_kwargs = {
         "input_format": args.input_format,
         "bus_width": args.bus_width,
@@ -2205,7 +1990,6 @@ def build_config_from_args(args: argparse.Namespace, profile: str) -> SoftmaxMod
 
 
 def format_float_list(values: Sequence[float], digits: int = 8) -> str:
-    """把浮点列表格式化成逗号分隔字符串。"""
     return ",".join(f"{value:.{digits}f}" for value in values)
 
 
@@ -2218,7 +2002,6 @@ def format_topk_rates(topk_rates: Dict[str, float]) -> str:
 
 
 def argmax_index(values: Sequence[float]) -> int:
-    """返回第一个最大值所在位置。"""
     if not values:
         raise ValueError("values must not be empty")
     best_idx = 0
@@ -2231,7 +2014,6 @@ def argmax_index(values: Sequence[float]) -> int:
 
 
 def summarize_profile(cfg: SoftmaxModelConfig) -> str:
-    """返回一行精简的精度模式摘要。"""
     shift_text = ",".join(f"{'+' if sign >= 0 else '-'}{shift}" for sign, shift in cfg.log2e_shift_terms)
     return (
         f"fx=Q{cfg.fx_int_width}.{cfg.fx_frac_width}, "
@@ -2249,7 +2031,6 @@ def summarize_profile(cfg: SoftmaxModelConfig) -> str:
 
 
 def print_output_field_guide() -> None:
-    """打印摘要输出字段说明。"""
     print("输出字段说明")
     print(
         "profile            : 当前精度档位，"
@@ -2283,7 +2064,6 @@ def print_output_field_guide() -> None:
 
 
 def print_batch_field_guide() -> None:
-    """打印批量评估字段说明。"""
     print("批量评估字段说明")
     print("profile            : 当前评估使用的精度档位")
     print("num_rows           : 参与统计的输入行数量")
@@ -2307,7 +2087,6 @@ def print_batch_field_guide() -> None:
 
 
 def print_result_summary(profile: str, cfg: SoftmaxModelConfig, result: SoftmaxRowResult) -> None:
-    """打印单一模式的摘要信息。"""
     shift_text = ",".join(f"{'+' if sign >= 0 else '-'}{shift}" for sign, shift in cfg.log2e_shift_terms)
     print(f"Softmax edge model summary [{profile}]")
     print(f"profile           : {profile}")
@@ -2351,7 +2130,6 @@ def print_result_summary(profile: str, cfg: SoftmaxModelConfig, result: SoftmaxR
 
 
 def expand_block_flags_to_elements(block_flags: Sequence[bool], total_elems: int, block_size: int) -> List[bool]:
-    """把 block 级标志扩展成逐元素标志。"""
     expanded: List[bool] = []
     for block_idx, block_flag in enumerate(block_flags):
         remaining = total_elems - block_idx * block_size
@@ -2471,7 +2249,6 @@ def evaluate_rows(
     topk_values: Sequence[int],
     num_workers: int = 1,
 ) -> SoftmaxBatchEvalSummary:
-    """遍历一批输入行，汇总 top1 一致率和误差统计。"""
     num_rows = len(rows)
     if num_rows == 0:
         raise ValueError("rows must not be empty")
@@ -2527,7 +2304,6 @@ def evaluate_rows(
 
 
 def print_batch_summary(summary: SoftmaxBatchEvalSummary, cfg: SoftmaxModelConfig) -> None:
-    """打印单一精度档位的批量评估摘要。"""
     print(f"Softmax batch evaluation [{summary.profile}]")
     print(f"profile           : {summary.profile}")
     print(f"profile_summary   : {summarize_profile(cfg)}")
@@ -2556,7 +2332,6 @@ def print_batch_summary(summary: SoftmaxBatchEvalSummary, cfg: SoftmaxModelConfi
 
 
 def build_batch_compare_dict(profile_runs: Sequence[Tuple[str, SoftmaxModelConfig, SoftmaxBatchEvalSummary]]) -> dict:
-    """生成多 profile 批量评估对比 JSON。"""
     payload = {
         profile: {
             "config": config_to_dict(cfg),
@@ -2574,7 +2349,6 @@ def build_batch_compare_dict(profile_runs: Sequence[Tuple[str, SoftmaxModelConfi
 
 
 def print_batch_compare_summary(profile_runs: Sequence[Tuple[str, SoftmaxModelConfig, SoftmaxBatchEvalSummary]]) -> None:
-    """并排打印多 profile 批量评估结果。"""
     first_profile, _, first_summary = profile_runs[0]
     del first_profile
     print("Softmax batch evaluation comparison")
@@ -2598,7 +2372,6 @@ def build_compare_dict(
     profile_runs: Sequence[Tuple[str, SoftmaxModelConfig, SoftmaxRowResult]],
     topk_values: Sequence[int],
 ) -> dict:
-    """生成多 profile 单行对比 JSON 结果。"""
     payload = {
         "input_row": list(row),
         "topk_values": list(topk_values),
@@ -2622,7 +2395,6 @@ def print_compare_summary(
     profile_runs: Sequence[Tuple[str, SoftmaxModelConfig, SoftmaxRowResult]],
     topk_values: Sequence[int],
 ) -> None:
-    """并排打印多 profile 单行精度模式结果。"""
     print("Softmax precision comparison")
     print("input_row         :", format_float_list(row, digits=4))
     reference_probs = profile_runs[0][2].reference_probs

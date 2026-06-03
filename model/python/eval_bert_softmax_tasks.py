@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""在 BERT 下游任务上评估不同 softmax 实现的任务级效果。
-
-评估目标：
-- `exact`：模型原始 softmax
-- `doc_adaptive_desc9_q7_special4`：默认的 2+7, block=8 近似 softmax
-- `doc_adaptive_desc9_q7_special4_block4`：2+7, block=4 的 RTL 对齐近似 softmax
-
-当前实现方式：
-- 使用 Hugging Face 上已经微调好的 BERT Base checkpoint
-- 仅在推理阶段替换 attention softmax
-- 默认先评估 GLUE 任务，便于和论文的任务级口径更接近
-
-重要说明：
-- 这是任务级评估，不再只是比较 softmax 行级数值误差
-- 替换的是 attention 内部 softmax，不是最后任务头的 logits 后处理
-- 为了避免修改用户现有环境，建议只在隔离环境中运行本脚本
-"""
 
 from __future__ import annotations
 
@@ -313,8 +296,6 @@ def resolve_local_model_dir(model_name: str) -> Path | None:
         ),
     )
 
-    # 常见离线失败场景是 config/tokenizer 和 weight 落在不同 snapshot。
-    # 这里把它们合并到本地目录，后续统一按本地路径加载。
     if config_snapshot is None or weight_snapshot is None:
         return None
 
@@ -516,7 +497,6 @@ class TaskProfileRunBundleItem:
 
 
 class ProgressPrinter:
-    """按固定时间间隔输出任务进度，便于后台 tail -f 观察。"""
 
     def __init__(self, task_name: str, profile: str, interval_sec: float):
         self.task_name = task_name
@@ -587,7 +567,6 @@ def print_progress_event(task_name: str, profile: str, phase: str, message: str)
 
 
 class ApproxSoftmaxRuntime:
-    """把 softmax_edge_model 的近似 softmax 封装成可替换的 torch softmax。"""
 
     def __init__(
         self,
@@ -712,7 +691,6 @@ class ApproxSoftmaxRuntime:
         return model
 
     def __call__(self, input_tensor: torch.Tensor, dim: int = -1, _stacklevel: int = 3, dtype=None) -> torch.Tensor:
-        # 只替换 attention 这种“最后一维做 softmax”的场景。
         if dim != -1:
             return self.fallback_softmax(input_tensor, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
 
@@ -805,7 +783,6 @@ class ApproxSoftmaxRuntime:
 
 @contextlib.contextmanager
 def patched_softmax(profile: str | None, input_format: str, collect_stats: bool = False):
-    """上下文内把 torch.nn.functional.softmax 临时替换成近似版本。"""
     if profile in (None, "", "exact"):
         yield
         return
@@ -1888,7 +1865,6 @@ def scan_task_prediction_diff(
     resources: LoadedTaskResources | None = None,
     progress_interval_sec: float = 30.0,
 ) -> TaskDiffScanResult:
-    """扫描 exact 与近似 softmax 下预测结果是否发生变化。"""
     resources = resources or load_task_resources(
         task_name,
         max_samples,
@@ -2044,12 +2020,6 @@ def _execute_task_profile(
 
 
 def run_task_bundle(request: TaskRunRequest) -> TaskRunBundle:
-    """执行单个 task 下的全部 profile。
-
-    这里故意保持“task 内串行、task 间并行”：
-    - 同一 task 的数据集和 Hugging Face 模型只加载一次；
-    - 不在线程间共享全局 softmax patch，避免互相覆盖。
-    """
     configure_runtime_threads(request.torch_threads, request.torch_interop_threads)
     resources = load_task_resources(
         task_name=request.task_name,
@@ -2107,10 +2077,6 @@ def _expand_task_profile_requests(requests: Sequence[TaskRunRequest]) -> List[Ta
 
 
 def run_task_profile_request(request: TaskProfileRunRequest) -> TaskProfileRunBundleItem:
-    """执行单个 task x profile 作业。
-
-    这种模式不共享 task 级资源，因此并行度更高，但会重复加载模型和数据。
-    """
     configure_runtime_threads(request.torch_threads, request.torch_interop_threads)
     print_progress_event(request.task_name, request.profile, "task", "profile run started")
     result, diff_result = _execute_task_profile(request, request.profile, resources=None)
@@ -2198,7 +2164,6 @@ def run_task_profile_bundles(requests: Sequence[TaskRunRequest], run_workers: in
 
 
 def run_task_bundles(requests: Sequence[TaskRunRequest], task_workers: int) -> List[TaskRunBundle]:
-    """按输入顺序返回 task 结果；并行失败时安全回退到串行。"""
     if not requests:
         return []
     if task_workers <= 1 or len(requests) == 1:

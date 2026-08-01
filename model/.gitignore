@@ -1,0 +1,17 @@
+.hf-cache/
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+bert/.hf-cache/
+longformer_wiki/.hf-cache/
+longformer_imdb/.hf-cache/
+
+results/*
+!results/.gitkeep
+!results/logs/
+results/logs/*
+!results/logs/.gitkeep
+
+*.tar.gz
